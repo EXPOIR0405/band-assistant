@@ -53,6 +53,10 @@ const DEFAULT_CONFIG = {
   REGION: '서울',                       // 아이디어 조사 때 장소·가격을 찾을 지역
   // 계획과 판단의 기준이 되는 나에 대한 설명. 목표·상황·선호를 적는다(Local.gs에 두는 걸 추천).
   PROFILE: '',
+
+  // 음성 일기 (Diary.gs)
+  DIARY_FOLDER: '일기',        // 내 드라이브에 만들 비공개 폴더
+  DIARY_REMIND_TIME: '23:00',  // 밤 일기 알림 시각. ''이면 알림 없이 [일기 쓰기] 버튼으로만
 };
 
 /**
@@ -133,6 +137,7 @@ function tick() {
       safely_('morning', CONFIG.PLANNER_ENABLED ? sendCheckin_ : morningBriefing);
     }
     if (CONFIG.PLANNER_ENABLED) safely_('planner', () => plannerTick_(now));
+    safely_('diary', () => diaryTick_(now));
     if (isDue_('EVENING', CONFIG.EVENING_TIME, now)) safely_('evening', eveningWrapUp);
   } finally {
     lock.releaseLock();
@@ -141,7 +146,7 @@ function tick() {
 
 /* ───────────────────────── 텔레그램 고정 버튼 ───────────────────────── */
 
-const QUICK_BUTTON_ROWS = [['오늘 계획', '할 일', '남은 일'], ['오늘 일정', '내일 일정']];
+const QUICK_BUTTON_ROWS = [['오늘 계획', '할 일', '남은 일'], ['오늘 일정', '내일 일정', '일기 쓰기']];
 const QUICK_BUTTONS = QUICK_BUTTON_ROWS.flat();
 
 /** 채팅창 아래에 항상 떠 있는 버튼 */
@@ -210,6 +215,9 @@ function pollTelegram() {
       const m = u.message;
       if (!m || String(m.chat.id) !== chatId) return; // 내 채팅방 외에는 무시
       if (nowSec_() - m.date > 600) return;           // 10분 넘은 메시지는 건너뜀
+      let inDiary = false;
+      safely_('diary', () => { inDiary = diaryInput_(m); });
+      if (inDiary) return;
       if (m.voice && CONFIG.PLANNER_ENABLED) safely_('voice', () => onVoice_(m.voice));
       else if (m.text) safely_('reply', () => answer_(m.text.trim()));
     });
@@ -243,6 +251,8 @@ function answer_(text) {
     showPlan_();
   } else if (text === '할 일' && CONFIG.PLANNER_ENABLED) {
     showTasks_();
+  } else if (text === '일기 쓰기') {
+    startDiary_();
   } else if (CONFIG.PLANNER_ENABLED && !text.startsWith('/')) {
     plannerMessage_(text);
   } else {
@@ -567,6 +577,7 @@ function cleanupPendingEvents_() {
 function handleCallback_(cq) {
   const [kind, arg] = String(cq.data || '').split(':');
   if (PLANNER_CALLBACKS.includes(kind)) return plannerCallback_(cq);
+  if (kind === 'dy') return diaryCallback_(cq);
   const [icon, text] = runAction_(kind, arg);
   tg_('answerCallbackQuery', { callback_query_id: cq.id, text: `${icon} ${text.split('\n')[0]}` });
   const msg = cq.message;

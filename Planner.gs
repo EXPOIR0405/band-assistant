@@ -402,7 +402,8 @@ function onIdea_(action, id) {
     notify_({ title: `보류: ${idea.title}`, message: '', priority: 2 });
     return;
   }
-  idea.steps.forEach(s => addTask_({ title: s.title, est_min: s.est_min, priority: 2, notes: `아이디어: ${idea.title}` }));
+  idea.steps.forEach(s => addTask_({ title: s.title, est_min: s.est_min, due: s.due, priority: 2,
+                                     notes: idea.source || `아이디어: ${idea.title}` }));
   notify_({ title: `할 일 ${idea.steps.length}개 추가`, message: idea.steps.map(s => `- ${s.title}`).join('\n'), priority: 2,
             actions: [{ label: '🔄 오늘 계획에 반영', data: 'plan:redo' }] });
 }
