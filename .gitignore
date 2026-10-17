@@ -1,0 +1,5 @@
+.clasp.json
+.clasprc.json
+.env
+# 개인 설정(주소·좌표 등) — 공개 저장소에 올리지 않음
+Local.gs
