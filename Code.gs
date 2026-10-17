@@ -4,7 +4,8 @@
  * 5분마다 tick()이 실행되며:
  *  - 새 메일 분류 → 중요 메일 알림 / 메일 속 일정 감지 → "캘린더에 추가할까요?"
  *  - 일정 10분 전 리마인드(관련 메일 맥락 포함), 장소 있는 일정은 출발 알림
- *  - 08:00 아침 브리핑(날씨 포함), 21:00 저녁 마무리 + 남은 일 "완료할까요?"
+ *  - 08:00 아침 체크인 → AI 플래너가 오늘 계획 제안(Planner.gs), 21:00 저녁 마무리 + 남은 일 "완료할까요?"
+ * 1분마다 pollTelegram()이 고정 버튼·버튼 누름·자유 메시지(글/음성)를 처리한다.
  * 알림은 텔레그램 봇 → 폰 → Mi Fitness → 밴드로 전달된다. 설치 순서는 README.md 참고.
  */
 
@@ -40,6 +41,18 @@ const DEFAULT_CONFIG = {
   DEPART_BUFFER_MIN: 10,     // 이동 시간에 더할 여유 시간
   MAX_DONE_PROMPTS: 3,       // 저녁에 "완료할까요?" 버튼 알림을 보낼 최대 개수
   STRIP_EMOJI: true,         // 밴드 글꼴이 일부 이모지를 못 그려 □로 깨지므로 알림 본문에서 뺀다(버튼은 유지)
+
+  // AI 플래너 (Planner.gs). false면 예전처럼 08:00 아침 브리핑만 보낸다.
+  PLANNER_ENABLED: true,
+  PLANNER_MODEL: 'gpt-5-mini',         // 계획·조사는 판단이 많아 nano보다 한 단계 위 모델
+  PLANNER_REASONING_EFFORT: 'low',
+  TRANSCRIBE_MODEL: 'gpt-4o-mini-transcribe', // 텔레그램 음성 메시지 → 글자
+  PLAN_CALENDAR: 'AI 플랜',            // 확정한 계획을 넣을 캘린더(없으면 만든다)
+  DAY_END: '23:00',                    // 계획을 짤 때 하루의 끝
+  CHECKIN_TIMEOUT_MIN: 30,             // 아침 체크인에 답이 없으면 이 시간 뒤 "보통"으로 계획
+  REGION: '서울',                       // 아이디어 조사 때 장소·가격을 찾을 지역
+  // 계획과 판단의 기준이 되는 나에 대한 설명. 목표·상황·선호를 적는다(Local.gs에 두는 걸 추천).
+  PROFILE: '',
 };
 
 /**
@@ -116,7 +129,10 @@ function tick() {
     safely_('poll-trigger', ensurePollTrigger_);
     safely_('mail', checkMail_);
     safely_('events', () => checkUpcomingEvents_(now));
-    if (isDue_('MORNING', CONFIG.MORNING_TIME, now)) safely_('morning', morningBriefing);
+    if (isDue_('MORNING', CONFIG.MORNING_TIME, now)) {
+      safely_('morning', CONFIG.PLANNER_ENABLED ? sendCheckin_ : morningBriefing);
+    }
+    if (CONFIG.PLANNER_ENABLED) safely_('planner', () => plannerTick_(now));
     if (isDue_('EVENING', CONFIG.EVENING_TIME, now)) safely_('evening', eveningWrapUp);
   } finally {
     lock.releaseLock();
@@ -125,11 +141,12 @@ function tick() {
 
 /* ───────────────────────── 텔레그램 고정 버튼 ───────────────────────── */
 
-const QUICK_BUTTONS = ['오늘 일정', '내일 일정', '남은 일'];
+const QUICK_BUTTON_ROWS = [['오늘 계획', '할 일', '남은 일'], ['오늘 일정', '내일 일정']];
+const QUICK_BUTTONS = QUICK_BUTTON_ROWS.flat();
 
 /** 채팅창 아래에 항상 떠 있는 버튼 */
 function quickKeyboard_() {
-  return { keyboard: [QUICK_BUTTONS.map(text => ({ text }))], resize_keyboard: true, is_persistent: true };
+  return { keyboard: QUICK_BUTTON_ROWS.map(row => row.map(text => ({ text }))), resize_keyboard: true, is_persistent: true };
 }
 
 /** 편집기에서 직접 실행: 1분 트리거를 확인하고 고정 버튼을 다시 띄운다. */
@@ -191,9 +208,10 @@ function pollTelegram() {
         return;
       }
       const m = u.message;
-      if (!m || !m.text || String(m.chat.id) !== chatId) return; // 내 채팅방 외에는 무시
-      if (nowSec_() - m.date > 600) return;                      // 10분 넘은 메시지는 건너뜀
-      safely_('reply', () => answer_(m.text.trim()));
+      if (!m || String(m.chat.id) !== chatId) return; // 내 채팅방 외에는 무시
+      if (nowSec_() - m.date > 600) return;           // 10분 넘은 메시지는 건너뜀
+      if (m.voice && CONFIG.PLANNER_ENABLED) safely_('voice', () => onVoice_(m.voice));
+      else if (m.text) safely_('reply', () => answer_(m.text.trim()));
     });
   } finally {
     lock.releaseLock();
@@ -221,6 +239,12 @@ function answer_(text) {
       message: open.map((o, i) => `${i + 1}. ${o.subject} (${o.from}, ${o.age})`).join('\n'),
       rows: chunk_(buttons, 5),
     });
+  } else if (text === '오늘 계획' && CONFIG.PLANNER_ENABLED) {
+    showPlan_();
+  } else if (text === '할 일' && CONFIG.PLANNER_ENABLED) {
+    showTasks_();
+  } else if (CONFIG.PLANNER_ENABLED && !text.startsWith('/')) {
+    plannerMessage_(text);
   } else {
     notify_({ title: '밴드 비서', message: '아래 버튼을 눌러 주세요: ' + QUICK_BUTTONS.join(' / '), keyboard: true });
   }
@@ -472,11 +496,12 @@ function eveningWrapUp() {
   const open = openItems_(10);
   const text = gpt_(
     '너는 하루 마무리 비서다. ' + BAND_STYLE +
-    ' 남은 일 개수, 내일 첫 일정과 전체 일정 수, 내일 날씨 중 챙길 것(비·추위)을 알려라.',
+    ' 오늘 계획 결과가 있으면 첫 줄에, 이어서 남은 일 개수, 내일 첫 일정과 전체 일정 수, 내일 날씨 중 챙길 것(비·추위)을 알려라.',
     `[아직 완료 안 한 중요 메일 ${open.length}개]\n` +
     open.map(o => `- ${o.subject} (${o.from}, ${o.age})`).join('\n') +
     `\n\n[내일 ${fmt_(tomorrow, 'M월 d일')} (${dow_(tomorrow)}) 일정]\n${eventsOn_(tomorrow)}` +
-    `\n\n[내일 날씨] ${weather_(1)}`);
+    `\n\n[내일 날씨] ${weather_(1)}` +
+    (CONFIG.PLANNER_ENABLED ? `\n\n[오늘 계획 결과] ${planStatsText_() || '(확정한 계획 없음)'}` : ''));
   notify_({ title: '🌙 오늘 마무리 · 내일 미리보기', message: text, priority: 3 });
 
   open.slice(0, CONFIG.MAX_DONE_PROMPTS).forEach(o => {
@@ -541,6 +566,7 @@ function cleanupPendingEvents_() {
  */
 function handleCallback_(cq) {
   const [kind, arg] = String(cq.data || '').split(':');
+  if (PLANNER_CALLBACKS.includes(kind)) return plannerCallback_(cq);
   const [icon, text] = runAction_(kind, arg);
   tg_('answerCallbackQuery', { callback_query_id: cq.id, text: `${icon} ${text.split('\n')[0]}` });
   const msg = cq.message;
@@ -574,6 +600,11 @@ function runAction_(kind, arg) {
     props_().deleteProperty('EVT_' + arg);
     const s = new Date(ev.start);
     return ['📅', `캘린더에 추가했어요\n${ev.title}\n${fmt_(s, 'M/d')}(${dow_(s)}) ${fmt_(s, 'HH:mm')}`];
+  }
+  if (kind === 'tk' && arg) {
+    const title = Tasks.Tasks.get('@default', arg).title;
+    completeTask_(arg);
+    return ['✅', '할 일을 완료했어요\n' + title];
   }
   return ['❓', '알 수 없는 요청이에요'];
 }
@@ -651,7 +682,9 @@ function tg_(method, payload) {
   return body;
 }
 
-function gpt_(system, user, json) {
+/** opts.model / opts.effort로 모델과 추론 단계를 바꿀 수 있다(기본: OPENAI_MODEL / OPENAI_REASONING_EFFORT). */
+function gpt_(system, user, json, opts = {}) {
+  const effort = 'effort' in opts ? opts.effort : CONFIG.OPENAI_REASONING_EFFORT;
   const key = props_().getProperty('OPENAI_API_KEY');
   if (!key) throw new Error('스크립트 속성에 OPENAI_API_KEY가 없습니다.');
   const res = UrlFetchApp.fetch('https://api.openai.com/v1/chat/completions', {
@@ -659,10 +692,10 @@ function gpt_(system, user, json) {
     contentType: 'application/json',
     headers: { Authorization: 'Bearer ' + key },
     payload: JSON.stringify({
-      model: CONFIG.OPENAI_MODEL,
+      model: opts.model || CONFIG.OPENAI_MODEL,
       messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
       response_format: json ? { type: 'json_object' } : undefined,
-      reasoning_effort: CONFIG.OPENAI_REASONING_EFFORT || undefined,
+      reasoning_effort: effort || undefined,
     }),
     muteHttpExceptions: true,
   });
